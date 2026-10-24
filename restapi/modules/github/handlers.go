@@ -2,6 +2,7 @@
 package github
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -81,6 +82,16 @@ func OnboardRepos(db database.DBConnection) fiber.Handler {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Invalid body"})
 		}
 
+		// Reject a malformed gitops endpoint up front (same rule as PUT
+		// /github/mapping) so nothing is imported or persisted half-way.
+		for fullRepoName, m := range req.RepoMappings {
+			if m.GitopsEndpoint != nil && !validGitopsEndpoint(strings.TrimSpace(*m.GitopsEndpoint)) {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+					"error": fmt.Sprintf("%s: gitopsEndpoint must be <endpoint name> or <org>/<endpoint name>", fullRepoName),
+				})
+			}
+		}
+
 		ctx := c.Context()
 
 		query := `FOR u IN users FILTER u.username == @username LIMIT 1 RETURN u`
@@ -127,7 +138,10 @@ func OnboardRepos(db database.DBConnection) fiber.Handler {
 			}
 			var gitopsEndpoint string
 			if mapping.GitopsEndpoint != nil {
-				gitopsEndpoint = strings.TrimSpace(*mapping.GitopsEndpoint)
+				// Bare "dh-prod" -> "<owner>/dh-prod" so the endpoint is listed
+				// under the repo's org, not the default "library" org. The saved
+				// mapping below keeps what the user entered.
+				gitopsEndpoint = qualifyGitopsEndpoint(owner, *mapping.GitopsEndpoint)
 			}
 
 			// Fetch repo metadata to determine visibility before creating releases.
@@ -177,38 +191,12 @@ func OnboardRepos(db database.DBConnection) fiber.Handler {
 				errors = append(errors, fmt.Sprintf("Failed to fetch releases for %s: %v", fullRepoName, err))
 			}
 
-			runs, err := FetchWorkflowRuns(appToken, owner, repo)
-			if err == nil {
-				for _, run := range runs {
-					if run.Conclusion == "success" {
-						endpointName := "github-actions/" + fullRepoName
-						endpoint := model.NewEndpoint()
-						endpoint.Name = endpointName
-						endpoint.EndpointType = "serverless"
-						endpoint.Environment = "ci"
-						endpoint.ParseAndSetNameComponents()
-						db.Collections["endpoint"].CreateDocument(ctx, endpoint)
-
-						sync := model.NewSync()
-						sync.EndpointName = endpointName
-						sync.ReleaseName = fullRepoName
-						version := run.HeadSha
-						if len(version) > 7 {
-							version = version[:7]
-						}
-						sync.ReleaseVersion = version
-						sync.SyncedAt = run.UpdatedAt
-						db.Collections["sync"].CreateDocument(ctx, sync)
-						processed++
-					}
-				}
-			}
-
 			// GitOps mapping: link the repo's latest release to the runtime
-			// endpoint/namespace it deploys to (e.g.
-			// "us-central-1_deployhub/deployhub"), the same Endpoint/Sync shape
-			// used by real cluster syncs, so CVEs found in this release can be
-			// traced to where it's actually running.
+			// endpoint it is deployed to (stored as "<org>/<endpoint>", e.g.
+			// "DeployHubProject/dh-prod"), the same Endpoint/Sync shape used by
+			// real cluster syncs, so CVEs found in this release can be traced
+			// to where it's actually running. This is the only endpoint an
+			// import creates: a CI workflow run is not a deployed runtime.
 			if gitopsEndpoint != "" {
 				if latestReleaseVersion == "" {
 					errors = append(errors, fmt.Sprintf("%s: gitops endpoint mapping given but no release found to sync", fullRepoName))
@@ -218,9 +206,11 @@ func OnboardRepos(db database.DBConnection) fiber.Handler {
 					endpoint.EndpointType = model.EndpointTypeCluster
 					endpoint.Environment = "production"
 					endpoint.ParseAndSetNameComponents()
-					// Ignore duplicate-key errors — the endpoint may already
-					// exist from a real cluster sync (Synced Endpoints).
-					db.Collections["endpoint"].CreateDocument(ctx, endpoint)
+					// Create it only once -- the endpoint may already exist from
+					// a real cluster sync (Synced Endpoints) or an earlier import.
+					if err := ensureEndpoint(ctx, db, endpoint); err != nil {
+						errors = append(errors, fmt.Sprintf("%s: gitops endpoint: %v", fullRepoName, err))
+					}
 
 					sync := model.NewSync()
 					sync.EndpointName = gitopsEndpoint
@@ -270,11 +260,95 @@ func OnboardRepos(db database.DBConnection) fiber.Handler {
 			}
 		}
 
+		// Import: have the scanner re-scan these repos' most recent releases on
+		// its next run, ignoring the old watermark.
+		if err := resetReleaseWatermarks(ctx, db, onboarded); err != nil {
+			errors = append(errors, fmt.Sprintf("failed to request a fresh release scan: %v", err))
+		}
+
 		return c.JSON(fiber.Map{
 			"message": fmt.Sprintf("Processed %d items via GitHub App", processed),
 			"errors":  errors,
 		})
 	}
+}
+
+// ensureEndpoint creates the endpoint unless one with the same name already
+// exists. Endpoint documents get an auto-generated _key and `name` has no
+// unique index, so a plain CreateDocument adds a duplicate on every call; the
+// endpoint may also already exist from a real cluster sync.
+func ensureEndpoint(ctx context.Context, dbConn database.DBConnection, endpoint *model.Endpoint) error {
+	cursor, err := dbConn.Database.Query(ctx, `FOR e IN endpoint FILTER e.name == @name LIMIT 1 RETURN 1`, &arangodb.QueryOptions{
+		BindVars: map[string]interface{}{"name": endpoint.Name},
+	})
+	if err != nil {
+		return err
+	}
+	exists := cursor.HasMore()
+	cursor.Close()
+	if exists {
+		return nil
+	}
+	_, err = dbConn.Collections["endpoint"].CreateDocument(ctx, endpoint)
+	return err
+}
+
+// validGitopsEndpoint reports whether s is empty (mapping cleared), a bare
+// endpoint name ("dh-prod") or "<org>/<endpoint name>", with no whitespace and
+// no empty part.
+func validGitopsEndpoint(s string) bool {
+	if s == "" {
+		return true
+	}
+	if strings.ContainsAny(s, " \t\r\n") || strings.Count(s, "/") > 1 {
+		return false
+	}
+	if i := strings.Index(s, "/"); i >= 0 {
+		return i > 0 && i < len(s)-1
+	}
+	return true
+}
+
+// qualifyGitopsEndpoint returns the endpoint name as stored in the endpoint
+// collection: a bare name is prefixed with the repo owner as its org
+// ("dh-prod" -> "<owner>/dh-prod"); "<org>/<name>" and "" are kept as-is.
+func qualifyGitopsEndpoint(owner, endpoint string) string {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" || strings.Contains(endpoint, "/") {
+		return endpoint
+	}
+	return owner + "/" + endpoint
+}
+
+// resetReleaseWatermarks clears the relscanner-job release watermark of the
+// given "owner/repo" repos (metadata/relscanner_state -> processed_releases,
+// keyed "github/<owner>/<repo>"). With no watermark the scanner treats the repo
+// as a fresh one on its next run and scans its most recent releases again,
+// ignoring the old watermark; afterwards it writes a new watermark, so later
+// runs respect it. Called when the user imports a repo or saves its mapping.
+// The scanner merges only the keys it touched when saving its state, so this
+// reset is not overwritten by a run that was already in progress.
+func resetReleaseWatermarks(ctx context.Context, db database.DBConnection, repos []string) error {
+	if len(repos) == 0 {
+		return nil
+	}
+	query := `
+		FOR doc IN [DOCUMENT("metadata/relscanner_state")]
+		  FILTER doc != null
+		  LET wanted = (FOR r IN @repos RETURN LOWER(CONCAT("github/", r)))
+		  LET current = doc.processed_releases || {}
+		  LET stale = (FOR k IN ATTRIBUTES(current) FILTER LOWER(k) IN wanted RETURN k)
+		  FILTER LENGTH(stale) > 0
+		  UPDATE doc WITH { processed_releases: UNSET(current, stale) } IN metadata OPTIONS { mergeObjects: false }
+		  RETURN 1`
+	cursor, err := db.Database.Query(ctx, query, &arangodb.QueryOptions{
+		BindVars: map[string]interface{}{"repos": repos},
+	})
+	if err != nil {
+		return err
+	}
+	defer cursor.Close()
+	return nil
 }
 
 // repoNameSet builds a lower-cased lookup set of "owner/repo" names.
@@ -394,13 +468,16 @@ func UpdateRepoMapping(db database.DBConnection) fiber.Handler {
 		if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.ContainsAny(repo, " \t\n") {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "repo must be owner/repo"})
 		}
-		artifact := strings.TrimSpace(req.ArtifactNamespace)
+		// artifactNamespace is optional: when the key is omitted the saved value
+		// is kept (the UI only edits the gitops endpoint); an explicit "" clears it.
+		keepArtifact := req.ArtifactNamespace == nil
+		artifact := ""
+		if req.ArtifactNamespace != nil {
+			artifact = strings.TrimSpace(*req.ArtifactNamespace)
+		}
 		gitops := strings.TrimSpace(req.GitopsEndpoint)
-		if gitops != "" {
-			i := strings.LastIndex(gitops, "/")
-			if i <= 0 || i == len(gitops)-1 {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "gitopsEndpoint must be <endpoint name>/<namespace>"})
-			}
+		if !validGitopsEndpoint(gitops) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "gitopsEndpoint must be <endpoint name> or <org>/<endpoint name>"})
 		}
 
 		ctx := c.Context()
@@ -414,9 +491,14 @@ func UpdateRepoMapping(db database.DBConnection) fiber.Handler {
 			    (FOR k IN ATTRIBUTES(u.github_repo_mappings || {})
 			       FILTER LOWER(k) != repoKey
 			       RETURN { [k]: u.github_repo_mappings[k] })))
-			  LET mappings = (@artifact == "" AND @gitops == "")
+			  LET existing = FIRST(
+			    FOR k IN ATTRIBUTES(u.github_repo_mappings || {})
+			      FILTER LOWER(k) == repoKey
+			      RETURN u.github_repo_mappings[k])
+			  LET artifactVal = @keepArtifact ? (existing.artifact_namespace || "") : @artifact
+			  LET mappings = (artifactVal == "" AND @gitops == "")
 			    ? rest
-			    : MERGE(rest, { [@repo]: { artifact_namespace: @artifact, gitops_endpoint: @gitops } })
+			    : MERGE(rest, { [@repo]: { artifact_namespace: artifactVal, gitops_endpoint: @gitops } })
 			  UPDATE u WITH {
 			    github_repo_mappings: mappings,
 			    updated_at: DATE_ISO8601(DATE_NOW())
@@ -424,7 +506,7 @@ func UpdateRepoMapping(db database.DBConnection) fiber.Handler {
 			  RETURN 1`
 		cursor, err := db.Database.Query(ctx, query, &arangodb.QueryOptions{
 			BindVars: map[string]interface{}{
-				"username": username, "repo": repo, "artifact": artifact, "gitops": gitops,
+				"username": username, "repo": repo, "artifact": artifact, "gitops": gitops, "keepArtifact": keepArtifact,
 			},
 		})
 		if err != nil {
@@ -435,10 +517,16 @@ func UpdateRepoMapping(db database.DBConnection) fiber.Handler {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Repo is not on your scan list; import it first"})
 		}
 
-		return c.JSON(fiber.Map{
+		// Save: have the scanner re-scan this repo's most recent releases on its
+		// next run, ignoring the old watermark, so the new mapping is applied.
+		resp := fiber.Map{
 			"message": "Mapping saved for " + repo,
 			"mapping": RepoMappingView{ArtifactNamespace: artifact, GitopsEndpoint: gitops},
-		})
+		}
+		if err := resetReleaseWatermarks(ctx, db, []string{repo}); err != nil {
+			resp["warning"] = "mapping saved, but a fresh release scan could not be requested: " + err.Error()
+		}
+		return c.JSON(resp)
 	}
 }
 
